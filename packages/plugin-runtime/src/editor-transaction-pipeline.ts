@@ -1,0 +1,467 @@
+import type {
+  ContributionRegistration,
+  EditorContext,
+  EditorId,
+  EditorTransaction,
+  EditorTransactionFilter,
+  EditorTransactionService,
+  EditorUpdateContext,
+  ManagedResource,
+  NexusDiagnostic,
+  OperationId,
+  RegistrationId,
+  RegistrationResult,
+  RegistrationState,
+  ResourceOwner,
+  ServiceResult,
+} from "@floatboat/nexus-plugin-api";
+import type {
+  CoreEditorTransactionDispatchResult,
+  CoreEditorTransactionFilter,
+  CoreEditorTransactionFilterResult,
+  CoreEditorUpdateListener,
+  EditorContributionRegistration,
+} from "@floatboat/nexus-core";
+
+import {
+  createDiagnostic,
+  createTransactionFrame,
+  DEFAULT_FILTER_REJECTION_REASON,
+  DIAGNOSTIC_ATTRIBUTION_FAILED_MESSAGE,
+  DISPOSED_MESSAGE,
+  DESTROYED_REGISTRATION_MESSAGE,
+  FILTER_CALLBACK_FAILED_MESSAGE,
+  LISTENER_CALLBACK_FAILED_MESSAGE,
+  normalizeTransactionPriority,
+  REENTRANT_DISPATCH_MESSAGE,
+  toCoreDispatchTransaction,
+  toCoreFilterResult,
+  toFilterContext,
+  toPluginTransaction,
+  toUpdateContext,
+  type TransactionFrame,
+} from "./editor-transaction-adapters";
+
+export interface EditorTransactionPipelineOptions {
+  readonly reportDiagnostic?: (diagnostic: NexusDiagnostic) => void;
+  /** 活取：切文件 / 换 surface 后必须反映最新上下文。 */
+  readonly context: () => EditorContext;
+}
+
+type TransactionHookKind = "filter" | "listener";
+
+interface TransactionHookOptions {
+  readonly key: string;
+  readonly localId: string;
+  readonly globalId: string;
+  readonly owner: ResourceOwner;
+  readonly kind: TransactionHookKind;
+  readonly priority: number;
+  /** Installs the physical core hook; called by activate(), never by register(). */
+  readonly install: () => EditorContributionRegistration;
+  readonly forget: (registration: TransactionHookRegistration) => void;
+  readonly reportDiagnostic: (diagnostic: NexusDiagnostic) => void;
+}
+
+/**
+ * Registration handle for one plugin transaction hook. It stays staged until the
+ * owning component activates it, and mirrors the platform's staged -> active ->
+ * quiescing -> disposed lifecycle.
+ */
+class TransactionHookRegistration implements ContributionRegistration, ManagedResource {
+  readonly key: string;
+  readonly localId: string;
+  readonly globalId: string;
+  readonly owner: ResourceOwner;
+  readonly kind: TransactionHookKind;
+  readonly priority: number;
+  private readonly options: TransactionHookOptions;
+  private currentState: RegistrationState = "staged";
+  private physical: EditorContributionRegistration | null = null;
+  private physicalDisposal: Promise<void> | null = null;
+  private disposal: Promise<void> | null = null;
+
+  constructor(options: TransactionHookOptions) {
+    this.options = options;
+    this.key = options.key;
+    this.localId = options.localId;
+    this.globalId = options.globalId;
+    this.owner = options.owner;
+    this.kind = options.kind;
+    this.priority = options.priority;
+  }
+
+  get id(): RegistrationId {
+    return this.key as RegistrationId;
+  }
+
+  get state(): RegistrationState {
+    return this.currentState;
+  }
+
+  get disposed(): boolean {
+    return this.currentState === "disposed";
+  }
+
+  activate(): void {
+    if (this.currentState !== "staged") return;
+    try {
+      this.physical = this.options.install();
+    } catch (error) {
+      // A destroyed editor cannot host the hook. Report it, then let the platform
+      // lifecycle handle the failed activation instead of degrading to a silent no-op.
+      this.options.reportDiagnostic(
+        createDiagnostic("unsupported-operation", DESTROYED_REGISTRATION_MESSAGE, {
+          cause: error,
+          owner: this.owner,
+        }),
+      );
+      throw error;
+    }
+    this.currentState = "active";
+  }
+
+  quiesce(): void {
+    if (this.currentState !== "staged" && this.currentState !== "active") return;
+    this.currentState = "quiescing";
+    this.options.forget(this);
+    void this.releasePhysical().catch((error: unknown) => {
+      this.options.reportDiagnostic(
+        createDiagnostic("lifecycle-cleanup-failed", "Transaction hook cleanup failed", {
+          cause: error,
+          owner: this.owner,
+        }),
+      );
+    });
+  }
+
+  dispose(): Promise<void> {
+    if (this.disposal) return this.disposal;
+    this.quiesce();
+    this.disposal = this.releasePhysical().then(
+      () => {
+        this.currentState = "disposed";
+      },
+      (error: unknown) => {
+        // The hook still counts as released; the failure stays observable.
+        this.currentState = "disposed";
+        throw error;
+      },
+    );
+    return this.disposal;
+  }
+
+  private releasePhysical(): Promise<void> {
+    if (this.physicalDisposal) return this.physicalDisposal;
+    const physical = this.physical;
+    this.physical = null;
+    this.physicalDisposal = physical ? Promise.resolve(physical.dispose()) : Promise.resolve();
+    return this.physicalDisposal;
+  }
+}
+
+/**
+ * Owner-scoped factory for the nexus.editor-transactions capability of exactly one
+ * attached editor. The host constructs one instance per attachEditor and disposes it
+ * on detach, so registration and dispatch never have to resolve "the current editor".
+ */
+export class EditorTransactionPipeline implements ManagedResource {
+  private readonly reportDiagnostic: (diagnostic: NexusDiagnostic) => void;
+  private readonly resolveContext: () => EditorContext;
+  private readonly editorId: EditorId;
+  private readonly hooks = new Set<TransactionHookRegistration>();
+  private sequence = 0;
+  private operationSequence = 0;
+  private frame: TransactionFrame | null = null;
+  /**
+   * Instance-level, deliberately not part of the frame: a commit the user typed has no
+   * dispatch frame, yet its filters must not be able to re-enter the pipeline either.
+   */
+  private filterDepth = 0;
+  private disposed = false;
+  private disposal: Promise<void> | null = null;
+
+  constructor(options: EditorTransactionPipelineOptions) {
+    this.reportDiagnostic = options.reportDiagnostic ?? (() => undefined);
+    this.resolveContext = options.context;
+    this.editorId = options.context().editorId;
+  }
+
+  createService(
+    owner: ResourceOwner,
+    registerResource: (resource: ManagedResource) => void,
+  ): EditorTransactionService {
+    return {
+      registerFilter: (filter, options) =>
+        this.register(owner, registerResource, "filter", options, (priority) =>
+          this.createFilterInstall(owner, filter, priority),
+        ),
+      registerUpdateListener: (listener, options) =>
+        this.register(owner, registerResource, "listener", options, (priority) =>
+          this.createListenerInstall(owner, listener, priority),
+        ),
+      dispatch: (editorId, transaction) => this.dispatch(owner, editorId, transaction),
+    };
+  }
+
+  dispose(): Promise<void> {
+    if (this.disposal) return this.disposal;
+    this.disposed = true;
+    const registrations = [...this.hooks].reverse();
+    this.hooks.clear();
+    this.disposal = Promise.allSettled(
+      registrations.map((registration) => registration.dispose()),
+    ).then((results) => {
+      const errors = results
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => result.reason);
+      if (errors.length > 0) {
+        throw new AggregateError(errors, "Editor transaction service cleanup failed");
+      }
+    });
+    return this.disposal;
+  }
+
+  private register(
+    owner: ResourceOwner,
+    registerResource: (resource: ManagedResource) => void,
+    kind: TransactionHookKind,
+    options: { readonly priority?: number } | undefined,
+    createInstall: (priority: number) => () => EditorContributionRegistration,
+  ): RegistrationResult<ContributionRegistration> {
+    if (this.disposed) {
+      const diagnostic = createDiagnostic("unsupported-operation", DISPOSED_MESSAGE, { owner });
+      this.reportDiagnostic(diagnostic);
+      return { ok: false, diagnostic };
+    }
+
+    let priority: number;
+    try {
+      priority = normalizeTransactionPriority(options?.priority);
+    } catch (error) {
+      const diagnostic = createDiagnostic(
+        "registration-conflict",
+        error instanceof Error ? error.message : String(error),
+        { cause: error, owner },
+      );
+      this.reportDiagnostic(diagnostic);
+      return { ok: false, diagnostic };
+    }
+
+    const sequence = ++this.sequence;
+    const localId = `${kind === "filter" ? "transaction-filter" : "update-listener"}-${sequence}`;
+    const registration = new TransactionHookRegistration({
+      key: `${kind}:${sequence}`,
+      localId,
+      globalId: `${owner.pluginId}:${localId}`,
+      owner,
+      kind,
+      priority,
+      install: createInstall(priority),
+      forget: (item) => {
+        this.hooks.delete(item);
+      },
+      reportDiagnostic: this.reportDiagnostic,
+    });
+
+    this.hooks.add(registration);
+    registerResource(registration);
+    return { ok: true, registration };
+  }
+
+  private createFilterInstall(
+    owner: ResourceOwner,
+    filter: EditorTransactionFilter,
+    priority: number,
+  ): () => EditorContributionRegistration {
+    const adapter = this.createFilterAdapter(owner, filter);
+    return () =>
+      this.resolveContext().contributions.registerTransactionFilter(
+        String(owner.pluginId),
+        adapter,
+        { priority },
+      );
+  }
+
+  private createListenerInstall(
+    owner: ResourceOwner,
+    listener: (update: EditorUpdateContext) => void,
+    priority: number,
+  ): () => EditorContributionRegistration {
+    const adapter = this.createListenerAdapter(owner, listener);
+    return () =>
+      this.resolveContext().contributions.registerUpdateListener(
+        String(owner.pluginId),
+        adapter,
+        { priority },
+      );
+  }
+
+  private createFilterAdapter(
+    owner: ResourceOwner,
+    filter: EditorTransactionFilter,
+  ): CoreEditorTransactionFilter {
+    return (coreContext): CoreEditorTransactionFilterResult => {
+      const frame = this.frame;
+      const transaction = toPluginTransaction(coreContext, frame);
+      let value: unknown;
+      this.filterDepth += 1;
+      try {
+        value = filter(toFilterContext(this.resolveContext(), transaction));
+      } catch (error) {
+        // A faulty filter is reported and skipped: the transaction the user (or another
+        // plugin) asked for still commits, and the remaining hooks still run.
+        this.reportDiagnostic(
+          createDiagnostic("callback-failed", FILTER_CALLBACK_FAILED_MESSAGE, {
+            cause: error,
+            owner,
+          }),
+        );
+        return { action: "accept" };
+      } finally {
+        this.filterDepth -= 1;
+      }
+      const translation = toCoreFilterResult(value, {
+        frame,
+        getDocumentLength: () => this.resolveContext().editor.getDocument().length,
+      });
+      if (translation.kind === "invalid") {
+        this.reportDiagnostic(
+          createDiagnostic("callback-failed", translation.message, {
+            cause: translation.cause,
+            owner,
+          }),
+        );
+        return { action: "accept" };
+      }
+      return translation.result;
+    };
+  }
+
+  private createListenerAdapter(
+    owner: ResourceOwner,
+    listener: (update: EditorUpdateContext) => void,
+  ): CoreEditorUpdateListener {
+    return (coreUpdate) => {
+      const transaction = toPluginTransaction(coreUpdate, this.frame);
+      const update = toUpdateContext(
+        this.resolveContext(),
+        transaction,
+        coreUpdate.documentBefore,
+        coreUpdate.documentAfter,
+      );
+      try {
+        listener(update);
+      } catch (error) {
+        // The commit already happened; a faulty observer is reported and skipped so the
+        // remaining listeners still see the update.
+        this.reportDiagnostic(
+          createDiagnostic("callback-failed", LISTENER_CALLBACK_FAILED_MESSAGE, {
+            cause: error,
+            owner,
+          }),
+        );
+      }
+    };
+  }
+
+  private dispatch(
+    owner: ResourceOwner,
+    editorId: EditorId,
+    transaction: EditorTransaction,
+  ): ServiceResult<{ readonly operationId: OperationId }> {
+    if (this.disposed) {
+      // A released service reports the rejection, like a late registration: the caller
+      // still has to see that the instance it is holding no longer commits anything.
+      const diagnostic = createDiagnostic("unsupported-operation", DISPOSED_MESSAGE, { owner });
+      this.reportDiagnostic(diagnostic);
+      return { ok: false, diagnostic };
+    }
+    if (editorId !== this.editorId) {
+      return {
+        ok: false,
+        diagnostic: createDiagnostic(
+          "unsupported-operation",
+          `Editor '${editorId}' is not served by this transaction service`,
+          { owner },
+        ),
+      };
+    }
+    if (this.filterDepth > 0) {
+      // Committing from inside a filter would land a nested state update before the
+      // outer one, which discards the outer transaction in CodeMirror.
+      return {
+        ok: false,
+        diagnostic: createDiagnostic("unsupported-operation", REENTRANT_DISPATCH_MESSAGE, {
+          owner,
+        }),
+      };
+    }
+
+    const operationId =
+      transaction.operationId ?? (`editor-operation:${++this.operationSequence}` as OperationId);
+    const frame = createTransactionFrame(operationId, transaction.annotations);
+    const previous = this.frame;
+    this.frame = frame;
+    let result: CoreEditorTransactionDispatchResult;
+    try {
+      result = this.resolveContext().editor.dispatchTransaction(
+        toCoreDispatchTransaction(transaction),
+      );
+    } finally {
+      this.frame = previous;
+    }
+
+    if (result.status === "success") {
+      return { ok: true, value: { operationId } };
+    }
+    if (result.status === "recursion-limit") {
+      return {
+        ok: false,
+        diagnostic: createDiagnostic(
+          "unsupported-operation",
+          `Transaction dispatch recursion limit (${result.limit}) reached`,
+          { owner },
+        ),
+      };
+    }
+    if (frame.rejectionDiagnostic !== null) {
+      return { ok: false, diagnostic: this.attachOwner(frame.rejectionDiagnostic, owner) };
+    }
+    return {
+      ok: false,
+      diagnostic: {
+        ...createDiagnostic(
+          "unsupported-operation",
+          result.reason ?? DEFAULT_FILTER_REJECTION_REASON,
+          { owner },
+        ),
+        resourceId: result.ownerId,
+      },
+    };
+  }
+
+  /**
+   * A plugin-supplied diagnostic passes through untouched; the runtime only fills the
+   * plugin attribution it is authoritative for, and never rewrites other keys.
+   */
+  private attachOwner(diagnostic: NexusDiagnostic, owner: ResourceOwner): NexusDiagnostic {
+    if (diagnostic.plugin !== undefined) return diagnostic;
+    const plugin = { id: owner.pluginId, version: "unknown" };
+    if (Object.isExtensible(diagnostic)) {
+      try {
+        return Object.assign(diagnostic, { plugin });
+      } catch (error) {
+        // A host-frozen diagnostic still has to be reported, with its attribution and without
+        // letting the failure escape as a throw on the caller's dispatch path.
+        this.reportDiagnostic(
+          createDiagnostic("unsupported-operation", DIAGNOSTIC_ATTRIBUTION_FAILED_MESSAGE, {
+            cause: error,
+            owner,
+          }),
+        );
+      }
+    }
+    return { ...diagnostic, plugin };
+  }
+}
