@@ -40,7 +40,9 @@ import {
   toCoreDispatchTransaction,
   toCoreFilterResult,
   toFilterContext,
+  toOperationId,
   toPluginTransaction,
+  toRegistrationId,
   toUpdateContext,
   type TransactionFrame,
 } from "./editor-transaction-adapters";
@@ -112,7 +114,7 @@ class TransactionHookRegistration implements ContributionRegistration, ManagedRe
   }
 
   get id(): RegistrationId {
-    return this.key as RegistrationId;
+    return toRegistrationId(this.key);
   }
 
   get state(): RegistrationState {
@@ -474,7 +476,7 @@ export class EditorTransactionPipeline implements ManagedResource {
     }
 
     const operationId =
-      transaction.operationId ?? (`editor-operation:${++this.operationSequence}` as OperationId);
+      transaction.operationId ?? toOperationId(`editor-operation:${++this.operationSequence}`);
     const frame = createTransactionFrame(operationId, transaction.annotations);
     const previous = this.frame;
     this.frame = frame;

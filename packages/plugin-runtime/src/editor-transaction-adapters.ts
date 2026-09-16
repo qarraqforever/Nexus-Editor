@@ -8,6 +8,7 @@ import {
   type JsonObject,
   type NexusDiagnostic,
   type OperationId,
+  type RegistrationId,
   type ResourceOwner,
   type TransactionFilterResult,
 } from "@floatboat/nexus-plugin-api";
@@ -78,6 +79,19 @@ export function createDiagnostic(
               : { message: String(options.cause) },
         }),
   };
+}
+
+/**
+ * Branded identifiers exist so that a plain string can become one at exactly one reviewable
+ * place (the same shape as `toCapabilityId` in `capability.ts`). Keeping the conversion here,
+ * and nowhere else, is what keeps the brand meaningful.
+ */
+export function toOperationId(value: string): OperationId {
+  return value as OperationId;
+}
+
+export function toRegistrationId(value: string): RegistrationId {
+  return value as RegistrationId;
 }
 
 /**
