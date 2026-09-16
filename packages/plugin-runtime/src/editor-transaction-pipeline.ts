@@ -67,6 +67,14 @@ interface TransactionHookOptions {
  * Registration handle for one plugin transaction hook. It stays staged until the
  * owning component activates it, and mirrors the platform's staged -> active ->
  * quiescing -> disposed lifecycle.
+ *
+ * staged    - known to this service only; nothing has been installed into core yet.
+ * active    - the core hook exists.
+ * quiescing - already forgotten by the service, physical hook not released yet.
+ * disposed  - released (idempotent).
+ * 状态机：staged（只登记在本服务，未装 core 钩子）-> active（钩子已装）
+ *   -> quiescing（已从本服务摘除、物理钩子尚在释放中）-> disposed（已释放，幂等）。
+ * 关键约束：activate() 之前绝不接触 core —— 注册成功不等于已生效。
  */
 class TransactionHookRegistration implements ContributionRegistration, ManagedResource {
   readonly key: string;

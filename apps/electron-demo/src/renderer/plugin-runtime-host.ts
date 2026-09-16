@@ -604,6 +604,9 @@ class ElectronPluginRuntimeHost implements PluginRuntimeHost {
       detach: () => {
         if (detachPromise) return detachPromise;
         removeFocusListener();
+        // Failures in this batch surface through the diagnostics bus only (never the console),
+        // so a clean log is NOT evidence that this cleanup succeeded.
+        // 注意：本批次的失败只上报诊断总线（不落 console）—— 日志里没有报错并不代表清理成功。
         detachPromise = (async () => {
           const results = await Promise.allSettled([
             clipboardProvider?.revoke("editor-detached"),
