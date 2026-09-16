@@ -26,6 +26,10 @@ export const FILTER_INVALID_REPLACEMENT_MESSAGE =
   "Editor transaction filter returned a transaction that cannot be applied";
 export const FILTER_CALLBACK_FAILED_MESSAGE = "Editor transaction filter failed";
 export const LISTENER_CALLBACK_FAILED_MESSAGE = "Editor transaction update listener failed";
+export const LISTENER_ASYNC_RESULT_MESSAGE =
+  "Editor transaction update listeners must return synchronously";
+export const FILTER_CONTEXT_UNAVAILABLE_MESSAGE =
+  "Editor transaction filter could not read the editor context";
 export const DISPOSED_MESSAGE = "The editor transaction service has been disposed";
 export const DESTROYED_REGISTRATION_MESSAGE =
   "Cannot register a transaction hook on a destroyed editor";
@@ -74,6 +78,28 @@ export function createDiagnostic(
               : { message: String(options.cause) },
         }),
   };
+}
+
+/**
+ * Adopts a promise the synchronous pipeline can never await. Without an owner its rejection
+ * would surface as a host-level unhandled rejection instead of staying inside the boundary
+ * that already reported the fault.
+ */
+export function adoptAbandonedThenable(
+  value: PromiseLike<unknown>,
+  onRejected?: (reason: unknown) => void,
+): void {
+  void Promise.resolve(value).then(undefined, (reason: unknown) => {
+    try {
+      onRejected?.(reason);
+    } catch {
+      // Reporting a fault must never become a second fault; there is no third channel.
+    }
+  });
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
 }
 
 export function normalizeTransactionPriority(priority: number | undefined): number {
@@ -152,48 +178,75 @@ export function isTransactionFilterResult(value: unknown): value is TransactionF
  * the host's editing path — the filter adapter has to reject it instead.
  */
 export function toCoreReplacementTransaction(
-  transaction: EditorTransaction,
+  transaction: unknown,
   documentLength: number,
 ): CoreEditorTransaction | null {
+  // Every field is read through a presence check: the payload comes from plugin code, and a
+  // validator that throws would be translated by core into a veto of the caller's commit.
+  const candidate = asRecord(transaction);
+  if (candidate === null) return null;
+  const rawChanges = candidate.changes;
+  if (!Array.isArray(rawChanges)) return null;
   const changes: CoreEditorChange[] = [];
-  for (const change of transaction.changes) {
+  for (const rawChange of rawChanges) {
+    const change = asRecord(rawChange);
+    if (change === null) return null;
+    const { from, to, insert } = change;
     if (
-      !Number.isInteger(change.from) ||
-      !Number.isInteger(change.to) ||
-      change.from < 0 ||
-      change.from > change.to ||
-      change.to > documentLength ||
-      typeof change.insert !== "string"
+      typeof from !== "number" ||
+      typeof to !== "number" ||
+      !Number.isInteger(from) ||
+      !Number.isInteger(to) ||
+      from < 0 ||
+      from > to ||
+      to > documentLength ||
+      typeof insert !== "string"
     ) {
       return null;
     }
-    changes.push({ from: change.from, to: change.to, insert: change.insert });
+    changes.push({ from, to, insert });
   }
 
-  const selection = transaction.selectionAfter;
-  if (!Array.isArray(selection?.ranges) || selection.ranges.length === 0) return null;
+  const selection = asRecord(candidate.selectionAfter);
+  if (selection === null) return null;
+  const rawRanges = selection.ranges;
+  if (!Array.isArray(rawRanges) || rawRanges.length === 0) return null;
+  const mainIndex = selection.mainIndex;
   if (
-    !Number.isInteger(selection.mainIndex) ||
-    selection.mainIndex < 0 ||
-    selection.mainIndex >= selection.ranges.length
+    typeof mainIndex !== "number" ||
+    !Number.isInteger(mainIndex) ||
+    mainIndex < 0 ||
+    mainIndex >= rawRanges.length
   ) {
     return null;
   }
   const ranges: SelectionState["ranges"] = [];
-  for (const range of selection.ranges) {
-    if (!Number.isInteger(range.anchor) || !Number.isInteger(range.head)) return null;
-    ranges.push({ anchor: range.anchor, head: range.head });
+  for (const rawRange of rawRanges) {
+    const range = asRecord(rawRange);
+    if (range === null) return null;
+    const { anchor, head } = range;
+    if (
+      typeof anchor !== "number" ||
+      typeof head !== "number" ||
+      !Number.isInteger(anchor) ||
+      !Number.isInteger(head)
+    ) {
+      return null;
+    }
+    ranges.push({ anchor, head });
   }
 
-  if (!Array.isArray(transaction.origin) || transaction.origin.some((item) => typeof item !== "string")) {
-    return null;
-  }
+  const rawOrigin = candidate.origin;
+  if (!Array.isArray(rawOrigin) || rawOrigin.some((item) => typeof item !== "string")) return null;
+
+  const userEvent = candidate.userEvent;
+  if (userEvent !== undefined && typeof userEvent !== "string") return null;
 
   return {
     changes,
-    selection: { ranges, mainIndex: selection.mainIndex },
-    origin: transaction.origin,
-    ...(transaction.userEvent === undefined ? {} : { userEvent: transaction.userEvent }),
+    selection: { ranges, mainIndex },
+    origin: rawOrigin as string[],
+    ...(userEvent === undefined ? {} : { userEvent }),
   };
 }
 
@@ -207,11 +260,15 @@ export function toCoreFilterResult(
     readonly frame: TransactionFrame | null;
     /** Lazily read; only the replace branch needs the pre-commit document length. */
     readonly getDocumentLength: () => number;
+    /** Receives the rejection reason of a promise this synchronous path can never await. */
+    readonly onAbandoned?: (reason: unknown) => void;
   },
 ): FilterTranslation {
   // Async results are not a shape question: the transaction pipeline is synchronous,
-  // so a promise is reported as its own failure before any shape check.
+  // so a promise is reported as its own failure before any shape check. It can never be
+  // awaited here, so it is adopted: an unowned rejection would surface as a host-level error.
   if (isThenable(value)) {
+    adoptAbandonedThenable(value, options.onAbandoned);
     return { kind: "invalid", message: FILTER_ASYNC_RESULT_MESSAGE };
   }
   if (!isTransactionFilterResult(value)) {
@@ -231,7 +288,16 @@ export function toCoreFilterResult(
   }
   // A replacement carries the caller's changeset only: operationId and annotations
   // belong to the dispatching call, not to a filter's rewrite of it.
-  const replacement = toCoreReplacementTransaction(value.transaction, options.getDocumentLength());
+  // Reading the document length reads the host context; a context that is gone (editor
+  // detached mid-commit) must degrade to "this replacement cannot be applied" rather than
+  // escape as a throw on the host's editing path.
+  let documentLength: number;
+  try {
+    documentLength = options.getDocumentLength();
+  } catch (error) {
+    return { kind: "invalid", message: FILTER_CONTEXT_UNAVAILABLE_MESSAGE, cause: error };
+  }
+  const replacement = toCoreReplacementTransaction(value.transaction, documentLength);
   if (replacement === null) {
     return { kind: "invalid", message: FILTER_INVALID_REPLACEMENT_MESSAGE };
   }

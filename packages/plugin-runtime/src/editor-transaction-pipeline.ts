@@ -24,6 +24,7 @@ import type {
 } from "@floatboat/nexus-core";
 
 import {
+  adoptAbandonedThenable,
   createDiagnostic,
   createTransactionFrame,
   DEFAULT_FILTER_REJECTION_REASON,
@@ -31,6 +32,8 @@ import {
   DISPOSED_MESSAGE,
   DESTROYED_REGISTRATION_MESSAGE,
   FILTER_CALLBACK_FAILED_MESSAGE,
+  isThenable,
+  LISTENER_ASYNC_RESULT_MESSAGE,
   LISTENER_CALLBACK_FAILED_MESSAGE,
   normalizeTransactionPriority,
   REENTRANT_DISPATCH_MESSAGE,
@@ -49,6 +52,15 @@ export interface EditorTransactionPipelineOptions {
 }
 
 type TransactionHookKind = "filter" | "listener";
+
+const REGISTRATION_RESOURCE_FAILED_MESSAGE =
+  "The host could not register the transaction hook resource";
+const INVALID_DISPATCH_TRANSACTION_MESSAGE = "dispatch requires an editor transaction object";
+const DISPATCH_FAILED_MESSAGE = "Editor transaction dispatch failed";
+
+function isObjectLike(value: unknown): boolean {
+  return typeof value === "object" && value !== null;
+}
 
 interface TransactionHookOptions {
   readonly key: string;
@@ -195,6 +207,19 @@ export class EditorTransactionPipeline implements ManagedResource {
     this.editorId = options.context().editorId;
   }
 
+  /**
+   * A reporter supplied by the host is a consumer callback like any other: it can throw, and
+   * its failure has nowhere left to go. Letting it escape would turn the reporting of one fault
+   * into a second fault on the very path that was handling the first.
+   */
+  private reportSafely(diagnostic: NexusDiagnostic): void {
+    try {
+      this.reportDiagnostic(diagnostic);
+    } catch {
+      // Intentionally swallowed: the only channel able to report this is the one that failed.
+    }
+  }
+
   createService(
     owner: ResourceOwner,
     registerResource: (resource: ManagedResource) => void,
@@ -239,7 +264,7 @@ export class EditorTransactionPipeline implements ManagedResource {
   ): RegistrationResult<ContributionRegistration> {
     if (this.disposed) {
       const diagnostic = createDiagnostic("unsupported-operation", DISPOSED_MESSAGE, { owner });
-      this.reportDiagnostic(diagnostic);
+      this.reportSafely(diagnostic);
       return { ok: false, diagnostic };
     }
 
@@ -252,7 +277,7 @@ export class EditorTransactionPipeline implements ManagedResource {
         error instanceof Error ? error.message : String(error),
         { cause: error, owner },
       );
-      this.reportDiagnostic(diagnostic);
+      this.reportSafely(diagnostic);
       return { ok: false, diagnostic };
     }
 
@@ -269,11 +294,23 @@ export class EditorTransactionPipeline implements ManagedResource {
       forget: (item) => {
         this.hooks.delete(item);
       },
-      reportDiagnostic: this.reportDiagnostic,
+      reportDiagnostic: (diagnostic) => this.reportSafely(diagnostic),
     });
 
     this.hooks.add(registration);
-    registerResource(registration);
+    try {
+      registerResource(registration);
+    } catch (error) {
+      // The registrar belongs to the host. If it refuses, the hook must not stay half-adopted:
+      // drop it here and answer with a deterministic failure instead of a throw.
+      this.hooks.delete(registration);
+      const diagnostic = createDiagnostic("unsupported-operation", REGISTRATION_RESOURCE_FAILED_MESSAGE, {
+        cause: error,
+        owner,
+      });
+      this.reportSafely(diagnostic);
+      return { ok: false, diagnostic };
+    }
     return { ok: true, registration };
   }
 
@@ -319,7 +356,7 @@ export class EditorTransactionPipeline implements ManagedResource {
       } catch (error) {
         // A faulty filter is reported and skipped: the transaction the user (or another
         // plugin) asked for still commits, and the remaining hooks still run.
-        this.reportDiagnostic(
+        this.reportSafely(
           createDiagnostic("callback-failed", FILTER_CALLBACK_FAILED_MESSAGE, {
             cause: error,
             owner,
@@ -332,9 +369,16 @@ export class EditorTransactionPipeline implements ManagedResource {
       const translation = toCoreFilterResult(value, {
         frame,
         getDocumentLength: () => this.resolveContext().editor.getDocument().length,
+        onAbandoned: (reason) =>
+          this.reportSafely(
+            createDiagnostic("callback-failed", FILTER_CALLBACK_FAILED_MESSAGE, {
+              cause: reason,
+              owner,
+            }),
+          ),
       });
       if (translation.kind === "invalid") {
-        this.reportDiagnostic(
+        this.reportSafely(
           createDiagnostic("callback-failed", translation.message, {
             cause: translation.cause,
             owner,
@@ -351,19 +395,32 @@ export class EditorTransactionPipeline implements ManagedResource {
     listener: (update: EditorUpdateContext) => void,
   ): CoreEditorUpdateListener {
     return (coreUpdate) => {
-      const transaction = toPluginTransaction(coreUpdate, this.frame);
-      const update = toUpdateContext(
-        this.resolveContext(),
-        transaction,
-        coreUpdate.documentBefore,
-        coreUpdate.documentAfter,
-      );
       try {
-        listener(update);
+        const transaction = toPluginTransaction(coreUpdate, this.frame);
+        const update = toUpdateContext(
+          this.resolveContext(),
+          transaction,
+          coreUpdate.documentBefore,
+          coreUpdate.documentAfter,
+        );
+        const result: unknown = listener(update);
+        // The listener is declared to return nothing; a promise returned anyway can never be
+        // awaited by this synchronous path. It is adopted here so its rejection is reported
+        // instead of surfacing later as a host-level unhandled rejection.
+        if (isThenable(result)) {
+          adoptAbandonedThenable(result, (reason) =>
+            this.reportSafely(
+              createDiagnostic("callback-failed", LISTENER_ASYNC_RESULT_MESSAGE, {
+                cause: reason,
+                owner,
+              }),
+            ),
+          );
+        }
       } catch (error) {
         // The commit already happened; a faulty observer is reported and skipped so the
         // remaining listeners still see the update.
-        this.reportDiagnostic(
+        this.reportSafely(
           createDiagnostic("callback-failed", LISTENER_CALLBACK_FAILED_MESSAGE, {
             cause: error,
             owner,
@@ -382,7 +439,7 @@ export class EditorTransactionPipeline implements ManagedResource {
       // A released service reports the rejection, like a late registration: the caller
       // still has to see that the instance it is holding no longer commits anything.
       const diagnostic = createDiagnostic("unsupported-operation", DISPOSED_MESSAGE, { owner });
-      this.reportDiagnostic(diagnostic);
+      this.reportSafely(diagnostic);
       return { ok: false, diagnostic };
     }
     if (editorId !== this.editorId) {
@@ -406,6 +463,16 @@ export class EditorTransactionPipeline implements ManagedResource {
       };
     }
 
+    if (!isObjectLike(transaction)) {
+      // Rejecting a payload that is not even an object is a deterministic answer, not a crash:
+      // the caller keeps a return value it can act on instead of an exception.
+      const diagnostic = createDiagnostic("unsupported-operation", INVALID_DISPATCH_TRANSACTION_MESSAGE, {
+        owner,
+      });
+      this.reportSafely(diagnostic);
+      return { ok: false, diagnostic };
+    }
+
     const operationId =
       transaction.operationId ?? (`editor-operation:${++this.operationSequence}` as OperationId);
     const frame = createTransactionFrame(operationId, transaction.annotations);
@@ -416,6 +483,15 @@ export class EditorTransactionPipeline implements ManagedResource {
       result = this.resolveContext().editor.dispatchTransaction(
         toCoreDispatchTransaction(transaction),
       );
+    } catch (error) {
+      // Reaching the editor can fail on its own (detached context, destroyed view). The caller
+      // gets a deterministic failure instead of a throw on a path that also carries user edits.
+      const diagnostic = createDiagnostic("unsupported-operation", DISPATCH_FAILED_MESSAGE, {
+        cause: error,
+        owner,
+      });
+      this.reportSafely(diagnostic);
+      return { ok: false, diagnostic };
     } finally {
       this.frame = previous;
     }
@@ -462,7 +538,7 @@ export class EditorTransactionPipeline implements ManagedResource {
       } catch (error) {
         // A host-frozen diagnostic still has to be reported, with its attribution and without
         // letting the failure escape as a throw on the caller's dispatch path.
-        this.reportDiagnostic(
+        this.reportSafely(
           createDiagnostic("unsupported-operation", DIAGNOSTIC_ATTRIBUTION_FAILED_MESSAGE, {
             cause: error,
             owner,

@@ -1004,3 +1004,198 @@ describe("EditorTransactionPipeline", () => {
     expect(afterDestroy.diagnostic.resourceId).toBe("host");
   });
 });
+
+
+describe("boundary locks: plugin faults degrade instead of vetoing or escaping", () => {
+  it("bypasses a replace result whose structure is missing instead of letting core veto the commit", async () => {
+    const { editor, attachment } = attachRealEditor("alpha");
+    const diagnostics: NexusDiagnostic[] = [];
+    const pipeline = createPipeline(attachment, (diagnostic) => diagnostics.push(diagnostic));
+    const collector = createResourceCollector();
+    const service = pipeline.createService(owner(), collector.register);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const malformedReplacements: Array<[string, unknown]> = [
+      ["missing transaction", { action: "replace" }],
+      ["undefined transaction", { action: "replace", transaction: undefined }],
+      ["non-iterable changes", { action: "replace", transaction: { ...transaction(), changes: null } }],
+      ["null change entry", { action: "replace", transaction: { ...transaction(), changes: [null] } }],
+    ];
+    let selected: unknown = malformedReplacements[0]![1];
+    const malformed = service.registerFilter(() => selected as never);
+    expect(malformed.ok).toBe(true);
+    await collector.activate();
+
+    for (const [label, payload] of malformedReplacements) {
+      selected = payload;
+      const before = editor.getDocument();
+      let result!: ReturnType<typeof service.dispatch>;
+      expect(() => {
+        result = service.dispatch(attachment.editorId, transaction());
+      }, label).not.toThrow();
+      expect(result.ok, label).toBe(true);
+      expect(editor.getDocument(), label).toBe("X" + before);
+      expect(diagnostics.at(-1), label).toMatchObject({ code: "callback-failed", phase: "callback" });
+    }
+    // Core's own filter-error veto path stays unreachable for plugin faults.
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it("takes over a rejected promise returned by a filter so it cannot surface later", async () => {
+    const { editor, attachment } = attachRealEditor("alpha");
+    const diagnostics: NexusDiagnostic[] = [];
+    const pipeline = createPipeline(attachment, (diagnostic) => diagnostics.push(diagnostic));
+    const collector = createResourceCollector();
+    const service = pipeline.createService(owner(), collector.register);
+    const registered = service.registerFilter(() => Promise.reject(new Error("filter boom")) as never);
+    expect(registered.ok).toBe(true);
+    await collector.activate();
+
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+    try {
+      const result = service.dispatch(attachment.editorId, transaction());
+      expect(result.ok).toBe(true);
+      expect(editor.getDocument()).toBe("Xalpha");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+    // Two diagnostics, one fault: the pipeline reports the synchronous contract violation when
+    // it sees the promise, and the adopted rejection carries the filter's own failure reason.
+    expect(diagnostics.map((diagnostic) => diagnostic.message)).toContain(
+      "Editor transaction filters must return synchronously",
+    );
+    expect(diagnostics.at(-1)).toMatchObject({
+      code: "callback-failed",
+      phase: "callback",
+      cause: { name: "Error", message: "filter boom" },
+    });
+    expect(rejections).toEqual([]);
+  });
+
+  it("reports an async update listener that rejects without leaving an unhandled rejection", async () => {
+    const { editor, attachment } = attachRealEditor("alpha");
+    const diagnostics: NexusDiagnostic[] = [];
+    const pipeline = createPipeline(attachment, (diagnostic) => diagnostics.push(diagnostic));
+    const collector = createResourceCollector();
+    const service = pipeline.createService(owner(), collector.register);
+    const registered = service.registerUpdateListener((async () => {
+      throw new Error("listener boom");
+    }) as never);
+    expect(registered.ok).toBe(true);
+    await collector.activate();
+
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+    try {
+      const result = service.dispatch(attachment.editorId, transaction());
+      expect(result.ok).toBe(true);
+      expect(editor.getDocument()).toBe("Xalpha");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+    expect(diagnostics.at(-1)).toMatchObject({
+      code: "callback-failed",
+      phase: "callback",
+      cause: { name: "Error", message: "listener boom" },
+    });
+    expect(rejections).toEqual([]);
+  });
+
+  it("refuses a dispatch with a missing transaction instead of throwing at the caller", async () => {
+    const { attachment } = attachRealEditor("alpha");
+    const pipeline = createPipeline(attachment);
+    const service = pipeline.createService(owner(), () => undefined);
+    const payloads: Array<[string, unknown]> = [
+      ["undefined", undefined],
+      ["null", null],
+      ["number", 0],
+    ];
+    for (const [label, payload] of payloads) {
+      let result!: ReturnType<typeof service.dispatch>;
+      expect(() => {
+        result = service.dispatch(attachment.editorId, payload as never);
+      }, label).not.toThrow();
+      expect(result.ok, label).toBe(false);
+      if (result.ok) throw new Error(label + ": dispatch was accepted");
+      expect(result.diagnostic.code, label).toBeDefined();
+    }
+  });
+
+  it("survives a diagnostic reporter that throws", async () => {
+    const { editor, attachment } = attachRealEditor("alpha");
+    const pipeline = createPipeline(attachment, () => {
+      throw new Error("reporter boom");
+    });
+    const collector = createResourceCollector();
+    const service = pipeline.createService(owner(), collector.register);
+    const registered = service.registerFilter((context) => {
+      if (context.transaction.userEvent === "boom") throw new Error("filter exploded");
+      return { action: "accept" };
+    });
+    expect(registered.ok).toBe(true);
+    await collector.activate();
+
+    let result!: ReturnType<typeof service.dispatch>;
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(() => {
+      result = service.dispatch(attachment.editorId, transaction({ userEvent: "boom" }));
+    }).not.toThrow();
+    expect(result.ok).toBe(true);
+    expect(editor.getDocument()).toBe("Xalpha");
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it("keeps a failing resource registrar from reporting a successful registration", async () => {
+    const { attachment } = attachRealEditor("alpha");
+    const diagnostics: NexusDiagnostic[] = [];
+    const pipeline = createPipeline(attachment, (diagnostic) => diagnostics.push(diagnostic));
+    const service = pipeline.createService(owner(), () => {
+      throw new Error("register boom");
+    });
+
+    let result!: ReturnType<typeof service.registerFilter>;
+    expect(() => {
+      result = service.registerFilter(() => ({ action: "accept" }));
+    }).not.toThrow();
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("a failing registrar reported a successful registration");
+    expect(result.diagnostic.code).toBeDefined();
+    await pipeline.dispose();
+  });
+
+  it("bypasses a filter whose replacement cannot be validated because the context is gone", async () => {
+    const { editor, attachment } = attachRealEditor("alpha");
+    const diagnostics: NexusDiagnostic[] = [];
+    let contextBroken = false;
+    const pipeline = new EditorTransactionPipeline({
+      context: () => {
+        if (contextBroken) throw new Error("context boom");
+        return attachment.context;
+      },
+      reportDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    const collector = createResourceCollector();
+    const service = pipeline.createService(owner(), collector.register);
+    const registered = service.registerFilter(() => {
+      contextBroken = true;
+      return { action: "replace", transaction: transaction() };
+    });
+    expect(registered.ok).toBe(true);
+    await collector.activate();
+
+    let result!: ReturnType<typeof service.dispatch>;
+    expect(() => {
+      result = service.dispatch(attachment.editorId, transaction());
+    }).not.toThrow();
+    expect(result.ok).toBe(true);
+    expect(editor.getDocument()).toBe("Xalpha");
+    expect(diagnostics.at(-1)).toMatchObject({ code: "callback-failed", phase: "callback" });
+  });
+});
